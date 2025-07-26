@@ -6,7 +6,8 @@ A pure bash script that securely connects to an RKE2 server via SSH, extracts th
 
 - 🚀 **Pure Bash**: No Python dependencies required
 - 🔐 **Multiple SSH Auth Methods**: SSH key and password authentication
-- 🧠 **Smart Merging**: Intelligently merges with existing kubeconfig using multiple strategies
+- 🧠 **Smart Merging**: Intelligently merges with existing kubeconfig and replaces clusters with same name
+- 🔄 **Auto-Replacement**: Automatically replaces existing cluster credentials with new ones
 - 💾 **Backup Protection**: Automatically creates backups before modifications
 - 🧪 **Connection Testing**: Validates the connection after setup
 - 🎨 **Colored Output**: Clear status messages with intuitive colors
@@ -98,11 +99,11 @@ sudo yum install yq kubectl sshpass
 - Uses `yq` for precise YAML manipulation with `sed` fallback
 
 ### 4. **Smart Merging Strategy**
-The script uses a multi-tiered approach to merge configurations:
+The script uses a multi-tiered approach to merge configurations with automatic replacement:
 
-1. **kubectl merge** (preferred) - Uses Kubernetes' built-in merging capabilities
+1. **kubectl merge with replacement** (preferred) - Removes existing cluster entries and merges new config
 2. **yq merge** (backup) - Uses YAML-aware merging with `yq eval-all`
-3. **Append** (fallback) - Safely appends new config to existing one
+3. **Replace** (fallback) - Replaces existing config with new one to ensure fresh credentials
 
 ### 5. **Validation & Testing**
 - Creates automatic backups before modifications

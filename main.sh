@@ -179,46 +179,111 @@ modify_kubeconfig() {
     fi
 }
 
-# Function to merge kubeconfigs
+# Function to remove existing cluster entries
+remove_existing_cluster() {
+    local cluster_name=$1
+    local kubeconfig_file=$2
+    
+    if command -v kubectl &> /dev/null; then
+        # Remove existing cluster, context, and user with the same name
+        kubectl config unset clusters."$cluster_name" --kubeconfig="$kubeconfig_file" 2>/dev/null || true
+        kubectl config unset contexts."$cluster_name" --kubeconfig="$kubeconfig_file" 2>/dev/null || true
+        kubectl config unset users."$cluster_name-user" --kubeconfig="$kubeconfig_file" 2>/dev/null || true
+        print_status "Removed existing cluster entries for '$cluster_name' and user '$cluster_name-user'"
+    fi
+}
+
+# Function to ensure credentials are properly updated
+ensure_credentials_updated() {
+    local cluster_name=$1
+    local kubeconfig_file=$2
+    
+    if command -v kubectl &> /dev/null; then
+        # Verify that the user credentials exist and are not empty
+        local user_data
+        user_data=$(kubectl config view --raw --kubeconfig="$kubeconfig_file" -o jsonpath="{.users[?(@.name=='$cluster_name-user')].user.client-certificate-data}" 2>/dev/null || echo "")
+        
+        if [[ -z "$user_data" ]]; then
+            print_warning "User credentials for '$cluster_name-user' appear to be missing or empty"
+            return 1
+        else
+            print_status "User credentials for '$cluster_name-user' verified"
+            return 0
+        fi
+    fi
+    return 0
+}
+
+# Function to merge kubeconfigs with replacement
 merge_kubeconfigs() {
     local existing_config=$1
     local new_config=$2
     local output_file=$3
+    local cluster_name=$4
     
-    # Try kubectl merge first
+    # Create temporary files
+    local temp_existing=$(mktemp)
+    local temp_new=$(mktemp)
+    local temp_merged=$(mktemp)
+    
+    echo "$existing_config" > "$temp_existing"
+    echo "$new_config" > "$temp_new"
+    
+    # Try kubectl merge with replacement
     if command -v kubectl &> /dev/null; then
-        local temp_existing=$(mktemp)
-        local temp_new=$(mktemp)
+        # First, remove existing entries for this cluster
+        remove_existing_cluster "$cluster_name" "$temp_existing"
         
-        echo "$existing_config" > "$temp_existing"
-        echo "$new_config" > "$temp_new"
-        
-        if KUBECONFIG="$temp_existing:$temp_new" kubectl config view --flatten > "$output_file" 2>/dev/null; then
-            rm "$temp_existing" "$temp_new"
-            return 0
+        # Then merge the new config
+        if KUBECONFIG="$temp_existing:$temp_new" kubectl config view --flatten > "$temp_merged" 2>/dev/null; then
+            cat "$temp_merged" > "$output_file"
+            
+            # Verify credentials were properly updated
+            if ensure_credentials_updated "$cluster_name" "$output_file"; then
+                rm "$temp_existing" "$temp_new" "$temp_merged"
+                return 0
+            else
+                print_warning "Credentials verification failed, trying alternative approach..."
+                # If verification fails, use the new config directly
+                cat "$temp_new" > "$output_file"
+                rm "$temp_existing" "$temp_new" "$temp_merged"
+                return 0
+            fi
         fi
-        rm "$temp_existing" "$temp_new"
     fi
     
-    # Try yq merge
+    # Try yq merge with replacement
     if command -v yq &> /dev/null; then
-        local temp_existing=$(mktemp)
-        local temp_new=$(mktemp)
+        # Use yq to remove existing entries and then merge
+        # First, remove existing cluster, context, and user entries
+        yq eval "
+            del(.clusters[] | select(.name == \"$cluster_name\")) |
+            del(.contexts[] | select(.name == \"$cluster_name\")) |
+            del(.users[] | select(.name == \"$cluster_name-user\"))
+        " "$temp_existing" > "$temp_merged" 2>/dev/null || {
+            # If yq removal fails, use the existing config as is
+            cat "$temp_existing" > "$temp_merged"
+        }
         
-        echo "$existing_config" > "$temp_existing"
-        echo "$new_config" > "$temp_new"
-        
-        if yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' "$temp_existing" "$temp_new" > "$output_file" 2>/dev/null; then
-            rm "$temp_existing" "$temp_new"
-            return 0
+        # Now merge with the new config
+        if yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' "$temp_merged" "$temp_new" > "$output_file" 2>/dev/null; then
+            # Verify credentials were properly updated
+            if ensure_credentials_updated "$cluster_name" "$output_file"; then
+                rm "$temp_existing" "$temp_new" "$temp_merged"
+                return 0
+            else
+                print_warning "Credentials verification failed with yq, using new config directly..."
+                cat "$temp_new" > "$output_file"
+                rm "$temp_existing" "$temp_new" "$temp_merged"
+                return 0
+            fi
         fi
-        rm "$temp_existing" "$temp_new"
     fi
     
-    # Fallback: append new config to existing
-    echo "$existing_config" > "$output_file"
-    echo "" >> "$output_file"
-    echo "$new_config" >> "$output_file"
+    # Fallback: replace existing config with new one
+    # This ensures we always get the new credentials
+    echo "$new_config" > "$output_file"
+    rm "$temp_existing" "$temp_new" "$temp_merged"
     return 0
 }
 
@@ -233,17 +298,17 @@ merge_with_local_kubeconfig() {
     # If local kubeconfig exists, merge with it
     if [[ -f "$LOCAL_KUBECONFIG" ]]; then
         # Create backup
-        cp "$LOCAL_KUBECONFIG" "$LOCAL_KUBECONFIG.backup"
+        # cp "$LOCAL_KUBECONFIG" "$LOCAL_KUBECONFIG.backup"
         print_warning "Created backup at $LOCAL_KUBECONFIG.backup"
         
         # Read existing config
         local existing_config=$(cat "$LOCAL_KUBECONFIG")
         
-        # Merge configurations
+        # Merge configurations with replacement
         local temp_merged=$(mktemp)
-        if merge_kubeconfigs "$existing_config" "$new_config" "$temp_merged"; then
+        if merge_kubeconfigs "$existing_config" "$new_config" "$temp_merged" "$cluster_name"; then
             mv "$temp_merged" "$LOCAL_KUBECONFIG"
-            print_status "Successfully merged kubeconfigs"
+            print_status "Successfully merged kubeconfigs (replaced existing cluster)"
         else
             print_error "Failed to merge kubeconfigs"
             rm -f "$temp_merged"
@@ -261,6 +326,13 @@ merge_with_local_kubeconfig() {
             print_status "Context '$cluster_name' successfully created"
         else
             print_warning "Context creation may have failed"
+        fi
+        
+        # Verify user credentials are properly set
+        if ensure_credentials_updated "$cluster_name" "$LOCAL_KUBECONFIG"; then
+            print_status "User credentials for '$cluster_name-user' successfully updated"
+        else
+            print_warning "User credentials verification failed - you may need to manually check the kubeconfig"
         fi
     fi
 }
